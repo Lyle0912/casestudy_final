@@ -1,0 +1,658 @@
+---
+title: "Project 2"
+author: "Ly Le Thi"
+date: "2023-11-26"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load library
+
+
+```{r}
+rm(list = ls())
+```
+
+```{r, warning=FALSE}
+library(tidyverse)
+library(lubridate)
+library(readxl)
+library(dplyr) 
+library(ggplot2)
+library(zoo)
+library(here)
+library(readxl)
+library(dplyr)
+library(magrittr)
+library(ggplot2)
+library(mice)
+library(quantmod)
+library(tsibble)
+library(stats)
+library(purrr)
+library(rlang)
+library(forecast)
+library(lmSubsets)
+library(caret)
+library(rpart)
+library(randomForest)
+library(keras)
+library(neuralnet)
+```
+
+
+## a. Import dataset
+
+```{r}
+tsdata <- read_excel("~/Desktop/case study/PredictorData2022.xlsx")
+tsdata$yyyymm <- as.yearmon(as.character(tsdata$yyyymm), format="%Y%m")
+tsdata %<>% select(-CRSP_SPvw, -CRSP_SPvwx, -csp)
+vars_monthly <- names(tsdata)
+```
+
+```{r}
+# Rename the column
+colname_mapping <- c(
+"time" = "yyyymm",
+  "sp_index" = "Index",
+  "dividend_12" = "D12",
+  "earning_12" = "E12",
+  "bookmarketRatio" = "b/m",
+  "treasury_bill" = "tbl",
+  "cor_AAA" = "AAA",
+  "cor_BAA" = "BAA",
+  "longterm_yeild" = "lty",
+  "net_equity" = "ntis",
+  "risk_free" = "Rfree",
+  "inflation" = "infl",
+  "long_returnrate" = "ltr",
+  "cbond_return" = "corpr",
+  "stock_var" = "svar"
+)
+
+filtered_dict_monthly <- colname_mapping[colname_mapping %in% colnames(tsdata)]
+tsdata <- rename(tsdata, !!!filtered_dict_monthly)
+
+# Transform variables into numeric
+for(i in names(tsdata)) {
+  if(class(tsdata[[i]]) == "character") {
+    tsdata[[i]] <- as.numeric(tsdata[[i]])
+  }
+}
+```
+
+## Generate the excess returns series
+
+```{r}
+calculate_returns <- function(input){
+  input %<>% mutate(returns = as.vector(quantmod::Delt(sp_index))) 
+  input %<>% mutate(excess_returns = returns - risk_free)
+  return(input)
+}
+tsdata %<>% calculate_returns()
+```
+
+```{r}
+excessmonth <- tsdata%>% dplyr::select(c("time", "excess_returns"))
+# Taking the lag
+for (i in 1:10) {
+  excessmonth <- mutate(excessmonth, !!paste("lag_", i, sep = "") := lag(excess_returns, i))
+}
+```
+
+```{r}
+# lag_predictors <- function(input){
+#   output <- input %>%
+#     mutate(across(-c(time, excess_returns), lag, .names = "lag_{.col}")) %>% 
+#     select(time, excess_returns, starts_with("")) %>% 
+#     slice(-1) 
+#   return(output)
+# }
+# 
+# tsdata <- lag_predictors(tsdata)
+```
+
+
+```{r}
+
+tsdata <- merge(tsdata, excessmonth, by = "time", all.x = TRUE) # Join excessmonth with tsdata for the all predictors model
+tsdata <- tsdata[, -grep("excess_returns.y", colnames(tsdata))]
+
+# Rename lagged variables
+lag_cols <- grep("^lag_", colnames(tsdata), value = TRUE)
+new_names <- gsub("^lag_", "excess_returns_lag_", lag_cols)
+colnames(tsdata)[grep("^lag_", colnames(tsdata))] <- new_names
+```
+
+#Training testing set historical data
+
+
+```{r}
+excessmonth <- na.omit(excessmonth)
+```
+
+
+```{r}
+# Traing and testing set
+split_point <- floor(0.8 * nrow(excessmonth))
+
+# Create training and testing sets based on the split point
+train_data <- subset(excessmonth, time <= excessmonth$time[split_point])
+test_data <- subset(excessmonth, time > excessmonth$time[split_point])
+```
+
+
+```{r, warning=FALSE}
+
+max_lag <- 10
+
+all_predictions <- numeric(0) # Initiate vector
+
+ctrl <- trainControl(method = "timeslice", initialWindow = 100, horizon = 1, fixedWindow = TRUE, verboseIter = TRUE) # Rolling window forecast with cv for timeseries
+
+hyperparameter_grid <- expand.grid(cp = seq(0.001, 0.1, by = 0.001)) # Hyperparameter grid for tuning
+
+# Initialize an empty data frame to store feature importance values
+feature_importance <- data.frame(Feature = character(), Importance = numeric())
+
+# Rolling window cross-validation with hyperparameter tuning
+for (i in 101:(nrow(excessmonth) - 1)) {
+  train_data <- excessmonth[(i - 100):i, ] # Training and testing data for the current iteration
+  test_data <- excessmonth[(i + 1):(i + 1), ]
+ 
+  formula <- as.formula(paste("excess_returns ~", paste(paste("lag_", 1:max_lag, sep = ""), collapse = " + ")))  # Formula for the regression tree
+  
+  model <- train(
+    formula,
+    data = train_data,
+    method = "rpart", 
+    trControl = ctrl,
+    tuneGrid = hyperparameter_grid
+  )
+
+  # Extract feature importance
+  importance_values <- varImp(model, scale = FALSE)$importance
+  feature_importance <- rbind(feature_importance, data.frame(Feature = rownames(importance_values), Importance = importance_values[, 1]))
+
+  # Make predictions 
+  iteration_predictions <- predict(model, newdata = test_data)
+  excessmonth[(i + 1):(i + 1), "predicted_excess_returns"] <- iteration_predictions # Pull back to excessmonth
+  optimal_hyperparameters <- model$bestTune # Store the optimal hyperparameters
+}
+
+# Plot results
+ggplot(excessmonth, aes(x = time)) +
+  geom_line(aes(y = excess_returns, color = "Actual")) +
+  geom_line(aes(y = predicted_excess_returns, color = "Predicted"), linetype = "dashed") +
+  labs(title = "Actual vs. Predicted Excess Returns using Regression Tree",
+       x = "Time",
+       y = "Excess Returns") +
+  scale_color_manual(values = c("Actual" = "blue", "Predicted" = "red"))
+
+print(optimal_hyperparameters)
+
+msfe <- mean((excessmonth$excess_returns - excessmonth$predicted_excess_returns)^2, na.rm = TRUE)
+
+cat("Mean Squared Forecast Error (MSFE):", msfe, "\n")
+
+
+```
+
+
+```{r, warning=FALSE}
+
+max_lag <- 10
+
+all_predictions_rf <- numeric(0) # Initiate vector
+
+ctrl_rf <- trainControl(method = "timeslice", initialWindow = 100, horizon = 1, fixedWindow = TRUE, verboseIter = TRUE) # Rolling window forecast
+
+hyperparameter_grid_rf <- expand.grid(mtry = seq(1, max_lag, by = 1)) # Hyperparameter grid for tuning (mtry is the number of variables randomly sampled as candidates at each split)
+
+# Initialize an empty data frame to store feature importance values
+feature_importance_rf <- data.frame(Feature = character(), Importance = numeric())
+
+# Rolling window cross-validation with hyperparameter tuning
+for (i in 101:(nrow(excessmonth) - 1)) {
+  train_data_rf <- excessmonth[(i - 100):i, ] # Training and testing data for the current iteration
+  test_data_rf <- excessmonth[(i + 1):(i + 1), ]
+ 
+  formula_rf <- as.formula(paste("excess_returns ~", paste(paste("lag_", 1:max_lag, sep = ""), collapse = " + ")))  # Formula for the random forest
+  
+  model_rf <- train(
+    formula_rf,
+    data = train_data_rf,
+    method = "rf",  # Random forest
+    trControl = ctrl_rf,
+    tuneGrid = hyperparameter_grid_rf
+  )
+
+
+  importance_values_rf <- importance(model_rf$finalModel)
+  feature_importance_rf <- rbind(feature_importance_rf, data.frame(Feature = rownames(importance_values_rf), Importance = importance_values_rf[, 1]))
+
+  # Make predictions 
+  iteration_predictions_rf <- predict(model_rf, newdata = test_data_rf)
+  excessmonth[(i + 1):(i + 1), "predicted_excess_returns_rf"] <- iteration_predictions_rf # Pull back to excessmonth
+}
+# Plot results
+ggplot(excessmonth, aes(x = time)) +
+  geom_line(aes(y = excess_returns, color = "Actual")) +
+  geom_line(aes(y = predicted_excess_returns_rf, color = "Predicted"), linetype = "dashed") +
+  labs(title = "Actual vs. Predicted Excess Returns using Random Forest",
+       x = "Time",
+       y = "Excess Returns") +
+  scale_color_manual(values = c("Actual" = "blue", "Predicted" = "red"))
+
+msfe <- mean((excessmonth$excess_returns - excessmonth$predicted_excess_returns_rf)^2, na.rm = TRUE)
+
+cat("Mean Squared Forecast Error (MSFE):", msfe, "\n")
+
+```
+
+
+```{r}
+plot(varImp(model), main= "Variable Importance")
+print(varImp(model))
+
+```
+
+
+```{r}
+plot(varImp(model_rf), main= "Variable Importance")
+print(varImp(model_rf))
+```
+
+
+```{r, warning=FALSE}
+
+max_lag <- 10
+
+all_predictions_nn <- numeric(0)  # Initiate vector
+
+# Rolling window cross-validation
+for (i in 101:(nrow(excessmonth) - 1)) {
+  train_data_nn <- excessmonth[(i - 100):i, ]  # Training and testing data for the current iteration
+  test_data_nn <- excessmonth[(i + 1):(i + 1), ]
+
+  formula_nn <- as.formula(paste("excess_returns ~", paste(paste("lag_", 1:max_lag, sep = ""), collapse = " + ")))  # Formula for the neural network
+
+  nn_architecture <- c(10, 5, 1)  # Input layer with 10 neurons, hidden layer with 5 neurons, output layer with 1 neuron
+
+  model_nn <- neuralnet(
+    formula_nn,
+    data = train_data_nn,
+    hidden = nn_architecture[2],  # Number of neurons in the hidden layer
+    linear.output = TRUE  # Use a linear output for regression
+  )
+
+  # Make predictions
+  iteration_predictions_nn <- predict(model_nn, newdata = test_data_nn)
+  excessmonth[(i + 1):(i + 1), "predicted_excess_returns_nn"] <- iteration_predictions_nn 
+}
+
+# Plot results
+ggplot(excessmonth, aes(x = time)) +
+  geom_line(aes(y = excess_returns, color = "Actual")) +
+  geom_line(aes(y = predicted_excess_returns_nn, color = "Predicted"), linetype = "dashed") +
+  labs(title = "Actual vs. Predicted Excess Returns using Neural Network",
+       x = "Time",
+       y = "Excess Returns") +
+  scale_color_manual(values = c("Actual" = "blue", "Predicted" = "red"))
+
+msfe_nn <- mean((excessmonth$excess_returns - excessmonth$predicted_excess_returns_nn)^2, na.rm = TRUE)
+
+cat("Mean Squared Forecast Error (MSFE) for Neural Network:", msfe_nn, "\n")
+
+```
+
+
+
+In neural networks, calculating feature importance is not as straightforward as in some other machine learning models like random forests. Neural networks operate as complex, interconnected systems, and the contribution of each input to the output is distributed across the network's layers and weights.
+
+However, you can get some insights into feature importance in a neural network through methods like looking at the weights associated with the input features. In your case, since you're using the neuralnet package in R, you can extract the weights from the trained model and analyze them.
+
+
+
+```{r}
+set.seed(123)
+
+# Function to perform time series cross-validation
+ts_cv <- function(data, max_lag, nn_architecture, window_size = 100) {
+  n <- nrow(data)
+  all_predictions_nn <- numeric(0)
+
+  for (i in (window_size + 1):(n - 1)) {
+    train_data_nn <- data[(i - window_size):i, ]
+    test_data_nn <- data[(i + 1):(i + 1), ]
+
+    formula_nn <- as.formula(paste("excess_returns ~", paste(paste("lag_", 1:max_lag, sep = ""), collapse = " + ")))
+
+    model_nn <- neuralnet(
+      formula_nn,
+      data = train_data_nn,
+      hidden = nn_architecture[2],
+      linear.output = TRUE
+    )
+
+    iteration_predictions_nn <- predict(model_nn, newdata = test_data_nn)
+    data[(i + 1):(i + 1), "predicted_excess_returns_nn"] <- iteration_predictions_nn
+    all_predictions_nn <- c(all_predictions_nn, as.numeric(iteration_predictions_nn))
+  }
+
+  return(all_predictions_nn)
+}
+
+# Perform hyperparameter tuning using grid search
+hyperparameters <- expand.grid(
+  lag = seq(1, 10),
+  hidden_neurons = seq(5, 20, by = 5)
+)
+
+# Initialize variables to store the best hyperparameters and corresponding performance
+best_hyperparameters <- NULL
+best_performance <- Inf
+
+# Iterate over hyperparameter combinations
+for (i in 1:nrow(hyperparameters)) {
+  lag_val <- hyperparameters$lag[i]
+  hidden_neurons_val <- hyperparameters$hidden_neurons[i]
+
+  nn_architecture <- c(10, hidden_neurons_val, 1)
+
+  predictions <- ts_cv(excessmonth, lag_val, nn_architecture)  # Perform cross-validation with current hyperparameters
+
+  performance <- sqrt(mean((excessmonth$excess_returns[(window_size + 1):(nrow(excessmonth) - 1)] - predictions)^2))
+
+  # Update best hyperparameters if the current performance is better
+  if (performance < best_performance) {
+    best_performance <- performance
+    best_hyperparameters <- c(lag = lag_val, hidden_neurons = hidden_neurons_val)
+  }
+}
+
+print("Best Hyperparameters:")
+print(best_hyperparameters)
+```
+
+
+```{r, warning=FALSE}
+
+ggplot(excessmonth, aes(x = time)) +
+  geom_line(aes(y = excess_returns, color = "Actual")) +
+  geom_line(aes(y = predicted_excess_returns_nn, color = "Predicted"), linetype = "dashed") +
+  labs(title = "Actual vs. Predicted Excess Returns using Neural Network",
+       x = "Time",
+       y = "Excess Returns") +
+  scale_color_manual(values = c("Actual" = "blue", "Predicted" = "red"))
+
+msfe_nn <- mean((excessmonth$excess_returns - excessmonth$predicted_excess_returns_nn)^2, na.rm = TRUE)
+
+cat("Mean Squared Forecast Error (MSFE) for Neural Network:", msfe_nn, "\n")
+```
+
+
+#Training testing set for the whole data
+
+```{r}
+# Traing and testing set
+split_point <- floor(0.8 * nrow(tsdata))
+
+# Create training and testing sets based on the split point
+train_data <- subset(tsdata, time <= tsdata$time[split_point])
+test_data <- subset(tsdata, time > tsdata$time[split_point])
+```
+
+
+```{r, warning=FALSE}
+tsdata <- na.omit(tsdata)
+
+target_variable <- "excess_returns.x"
+
+predictor_variables <- setdiff(names(tsdata), c(target_variable, "returns", "time", "sp_index"))
+feature_importance <- data.frame(Feature = character(), Importance = numeric())
+
+all_predictions <- numeric(0)  # Initiate vector
+
+ctrl <- trainControl(
+  method = "timeslice",
+  initialWindow = 100,
+  horizon = 1,
+  fixedWindow = TRUE,
+  verboseIter = TRUE
+)  # Rolling window forecast
+
+hyperparameter_grid <- expand.grid(cp = seq(0.001, 0.1, by = 0.001))  # Hyperparameter grid for tuning
+
+# Rolling window cross-validation with hyperparameter tuning
+for (i in 101:(nrow(tsdata) - 1)) {
+  train_data <- tsdata[(i - 100):i, ]  # Training and testing data for the current iteration
+  test_data <- tsdata[(i + 1):(i + 1), ]
+
+  formula <- as.formula(paste(target_variable, "~", paste(paste(predictor_variables, collapse = " + "), collapse = " + "))) 
+
+  model_all <- train(
+    formula,
+    data = train_data,
+    method = "rpart",  # Regression tree
+    trControl = ctrl,
+    tuneGrid = hyperparameter_grid
+  )
+
+  # Extract feature importance
+  importance_values <- varImp(model_all, scale = FALSE)$importance
+
+  # Store feature importance values
+  feature_importance <- rbind(feature_importance, data.frame(Feature = rownames(importance_values), Importance = importance_values[, 1]))
+
+  # Make predictions
+  iteration_predictions <- predict(model_all, newdata = test_data)
+  tsdata[(i + 1):(i + 1), "predicted_excess_returns"] <- iteration_predictions  # Pull back to tsdata
+  optimal_hyperparameters <- model_all$bestTune  # Store the optimal hyperparameters
+}
+ggplot(tsdata, aes(x = time)) +
+  geom_line(aes(y = excess_returns.x, color = "Actual")) +
+  geom_line(aes(y = predicted_excess_returns, color = "Predicted"), linetype = "dashed") +
+  labs(title = "Actual vs. Predicted Excess Returns using Regression Tree all",
+       x = "Time",
+       y = "Excess Returns") +
+  scale_color_manual(values = c("Actual" = "blue", "Predicted" = "red"))
+
+msfe_nn <- mean((tsdata$excess_returns.x - tsdata$predicted_excess_returns)^2, na.rm = TRUE)
+
+cat("Mean Squared Forecast Error (MSFE) for Regression Tree:", msfe_nn, "\n")
+
+```
+
+
+```{r}
+plot(varImp(model_all), main= "Variable Importance")
+print(varImp(model_all))
+```
+
+
+```{r, warning=FALSE}
+
+target_variable_rf <- "excess_returns.x"
+predictor_variables_rf <- setdiff(names(tsdata), c(target_variable_rf, "returns", "time", "sp_index", "predicted_excess_returns"))
+
+
+all_predictions_rf <- numeric(0)  # Initiate vector
+
+ctrl_rf <- trainControl(
+  method = "timeslice",
+  initialWindow = 100,
+  horizon = 1,
+  fixedWindow = TRUE,
+  verboseIter = TRUE
+) 
+
+hyperparameter_grid_rf <- expand.grid(mtry = seq(1, max_lag, by = 1))  
+
+feature_importance_rf <- data.frame(Feature = character(), Importance = numeric())
+
+# Rolling window cross-validation with hyperparameter tuning
+for (i in 101:(nrow(tsdata) - 1)) {
+  train_data_rf <- tsdata[(i - 100):i, ]  # Training and testing data for the current iteration
+  test_data_rf <- tsdata[(i + 1):(i + 1), ]
+
+  formula_rf <- as.formula(paste(target_variable_rf, "~", paste(paste(predictor_variables_rf, collapse = " + "), collapse = " + ")))  # Formula for the random forest
+
+  model_rfall <- train(
+    formula_rf,
+    data = train_data_rf,
+    method = "rf",  # Random forest
+    trControl = ctrl_rf,
+    tuneGrid = hyperparameter_grid_rf
+  )
+
+  importance_values_rf <- importance(model_rfall$finalModel)
+  feature_importance_rf <- rbind(feature_importance_rf, data.frame(Feature = rownames(importance_values_rf), Importance = importance_values_rf[, 1]))
+
+  # Make predictions
+  iteration_predictions_rf <- predict(model_rfall, newdata = test_data_rf)
+  tsdata[(i + 1):(i + 1), "predicted_excess_returns_rf_all"] <- iteration_predictions_rf  # Pull back to tsdata
+}
+ggplot(tsdata, aes(x = time)) +
+  geom_line(aes(y = excess_returns.x, color = "Actual")) +
+  geom_line(aes(y = predicted_excess_returns_rf_all, color = "Predicted"), linetype = "dashed") +
+  labs(title = "Actual vs. Predicted Excess Returns using Random Forest all",
+       x = "Time",
+       y = "Excess Returns") +
+  scale_color_manual(values = c("Actual" = "blue", "Predicted" = "red"))
+
+msfe_nn <- mean((tsdata$excess_returns.x - tsdata$predicted_excess_returns_rf_all)^2, na.rm = TRUE)
+
+cat("Mean Squared Forecast Error (MSFE) for Random Forest:", msfe_nn, "\n")
+```
+
+
+```{r}
+plot(varImp(model_rfall), main= "Variable Importance")
+print(varImp(model_rfall))
+
+```
+
+
+
+## Neural Networks
+
+```{r, warning=FALSE}
+target_variable <- "excess_returns.x"
+predictor_variables <- setdiff(names(tsdata), c(target_variable, "returns", "time", "sp_index", "predicted_excess_returns_rf_all", "predicted_excess_returns"))
+
+all_predictions_nn <- numeric(0)
+
+# Rolling window cross-validation
+for (i in 101:(nrow(tsdata) - 1)) {
+  train_data_nn <- tsdata[1:i, ]  
+  test_data_nn <- tsdata[(i + 1):(i + 1), ]  
+
+  # Formula for the neural network
+  formula_nn <- as.formula(paste(target_variable, "~", paste(predictor_variables, collapse = " + ")))
+
+
+  nn_architecture <- c(10, 5, 1)  # Input layer with 10 neurons, hidden layer with 5 neurons, output layer with 1 neuron
+
+  # Train the neural network
+  model_nn_all <- neuralnet(
+    formula_nn,
+    data = train_data_nn,
+    hidden = nn_architecture[2],  # Number of neurons in the hidden layer
+    linear.output = TRUE  # Use a linear output for regression
+  )
+
+  
+  test_predictors <- dplyr::select(test_data_nn, all_of(predictor_variables)) # Extract predictors for the test data (excluding "returns")
+
+  iteration_predictions_nn <- predict(model_nn_all, newdata = test_predictors)
+  tsdata[(i + 1):(i + 1), "predicted_excess_returns_nn"] <- as.vector(iteration_predictions_nn)
+}
+
+
+```
+
+
+```{r, warning=FALSE}
+
+ggplot(tsdata, aes(x = time)) +
+  geom_line(aes(y = tsdata[[target_variable]], color = "Actual")) +
+  geom_line(aes(y = tsdata$predicted_excess_returns_nn, color = "Predicted"), linetype = "dashed") +
+  labs(title = "Actual vs. Predicted Excess Returns using Neural Network",
+       x = "Time",
+       y = "Excess Returns") +
+  scale_color_manual(values = c("Actual" = "blue", "Predicted" = "red"))
+
+# Calculate MSFE
+msfe_nn <- mean((tsdata[[target_variable]] - tsdata$predicted_excess_returns_nn)^2, na.rm = TRUE)
+
+
+
+
+cat("Mean Squared Forecast Error (MSFE) for Neural Network:", msfe_nn, "\n")
+```
+
+
+```{r, warning=FALSE}
+
+
+# Function to perform time series cross-validation
+ts_cv <- function(data, target_variable, predictor_variables, nn_architecture, window_size = 100) {
+  n <- nrow(data)
+  all_predictions_nn <- numeric(0)
+
+  for (i in (window_size + 1):(n - 1)) {
+    train_data_nn <- data[(i - window_size):i, ]
+    test_data_nn <- data[(i + 1):(i + 1), ]
+
+    formula_nn <- as.formula(paste(target_variable, "~", paste(predictor_variables, collapse = " + ")))
+
+    model_nn <- neuralnet(
+      formula_nn,
+      data = train_data_nn,
+      hidden = nn_architecture[2],
+      linear.output = TRUE
+    )
+
+    iteration_predictions_nn <- predict(model_nn, newdata = test_data_nn)
+    data[(i + 1):(i + 1), paste0("predicted_", target_variable, "_nn")] <- iteration_predictions_nn
+    all_predictions_nn <- c(all_predictions_nn, as.numeric(iteration_predictions_nn))
+  }
+
+  return(all_predictions_nn)
+}
+
+# Set target variable and predictor variables
+target_variable <- "excess_returns.x"
+predictor_variables <- setdiff(names(tsdata), c(target_variable, "returns", "time", "sp_index", "predicted_excess_returns_rf_all", "predicted_excess_returns", "predicted_excess_returns_nn"))
+
+hyper_grid <- expand.grid(
+  layer1 = seq(5, 20, by = 5),
+  layer2 = seq(5, 20, by = 5),
+  layer3 = seq(5, 20, by = 5)
+)
+
+model <- train(
+  as.formula(paste(target_variable, "~", paste(predictor_variables, collapse = " + "))),
+  data = tsdata,
+  method = "neuralnet",
+  metric = "RMSE",
+  tuneGrid = hyper_grid
+)
+
+# Best hyperparameters
+best_hyperparameters <- model$bestTune
+
+# Retrieve the best model
+best_model <- model$finalModel
+
+# Make predictions for the entire dataset
+tsdata[, paste0("predicted_", target_variable, "_nn")] <- predict(best_model, newdata = tsdata)
+
+
+```
+
+

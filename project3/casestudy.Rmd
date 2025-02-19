@@ -1,0 +1,368 @@
+---
+title: "Case Study Project 1"
+author: "Ly Le Thi"
+date: "2023-10-25"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load library
+
+
+```{r}
+library(tidyverse)
+library(lubridate)
+library(readxl)
+library(dplyr) 
+library(ggplot2)
+library(zoo)
+library(here)
+library(readxl)
+library(dplyr)
+library(magrittr)
+library(ggplot2)
+library(gridExtra)
+library(mice)
+library(forecast)
+```
+
+```{r}
+tsdata <- read_excel("~/Desktop/case study/PredictorData2022.xlsx")
+```
+
+## Data
+
+```{r, echo = FALSE, eval = FALSE}
+# Convert the yyyymm column to character
+tsdata$yyyymm <- as.character(tsdata$yyyymm)
+
+# Insert a hyphen to format it as "1871-01"
+tsdata$yyyymm <- sub("(\\d{4})(\\d{2})", "\\1-\\2", tsdata$yyyymm)
+
+# Rename the column
+
+colname_mapping <- c(
+  yyyymm = "time",
+  Index = "sp_index",
+  D12 = "dividend_12",
+  E12 = "earning_12",
+  `b/m` = "book_market",
+  tbl = "treasury_bill",
+  AAA = "cor_AAA",
+  BAA = "cor_BAA",
+  lty = "lt_yeild",
+  ntis = "net_equity",
+  Rfree = "risk_free",
+  infl = "inflation",
+  ltr = "lt_returnrate",
+  corpr = "cbond_return",
+  svar = "stock_var",
+  csp = "cs_premium",
+  CRSP_SPvw = "CRSP_SPvw",
+  CRSP_SPvwx = "CRSP_SPvwx"
+)
+
+
+# Rename the columns in the data frame
+colnames(tsdata) <- colname_mapping[colnames(tsdata)]
+```
+
+```{r, echo = FALSE, eval = FALSE}
+# change to time series
+tsdata$time <- as.yearmon(tsdata$time)
+# Transform variables into numeric
+for(i in colname_mapping) {
+  if(class(tsdata[[i]]) == "character") {
+    tsdata[[i]] <- as.numeric(tsdata[[i]])
+  }
+}
+
+# Drop the NA data
+row_with_na <- which(is.na(tsdata$risk_free))
+
+# remove NA value in the first row
+if (length(row_with_na) > 0 && row_with_na[1] == 1) {
+  tsdata <- tsdata[-1, ]
+}
+```
+
+
+```{r, echo = FALSE, eval = FALSE}
+# Lag the predictor
+
+tsdata <- tsdata %>% mutate(sp_index_lag1m = lag(sp_index, n = 1))
+
+# Calculate the excess returns
+
+tsdata <- tsdata %>%
+  mutate(returns = log(sp_index) - log(sp_index_lag1m),
+         excess_returns = returns - risk_free,
+         excess_returns_lagged = lead(excess_returns))
+
+```
+
+```{r, echo = FALSE, eval = FALSE, warning=FALSE}
+#Time series plot for predictors
+excess_returns_plot <- ggplot(tsdata, aes(x = time, y = excess_returns)) +
+  geom_line() +
+  labs(title = "Time Series Plot of Excess Returns", x = "Time", y = "Excess Return")
+
+print(excess_returns_plot)
+
+```
+
+# Plot ACF, PACF and calculate Var
+```{r}
+excess_rt <- na.omit(tsdata$excess_returns)
+```
+
+
+```{r}
+acf_result <- Acf(excess_rt, main = "ACF of Excess Return")
+```
+
+```{r}
+pacf_result <- pacf(excess_rt, main = "PACF of Excess Return")
+```
+
+```{r}
+
+# Calculate the variance of the excess return
+excess_return_variance <- var(excess_rt)
+cat("Variance of Excess Return:", excess_return_variance, "\n")
+
+```
+
+```{r}
+# Fit an AR model
+ar_model <- ar(excess_rt, order.max =21)
+
+# Print the model summary
+print(ar_model)
+```
+```{r}
+ar_coeffs <- ar_model$ar
+print(ar_coeffs)
+```
+```{r}
+# Define the maximum order
+max_order <- 21
+
+# Create a vector to store AIC values
+aic_values <- numeric(max_order)
+
+# Fit AR models from AR(1) to AR(21) and calculate AIC
+for (order in 1:max_order) {
+  ar_model <- ar(excess_rt, order.max = order)
+  log_likelihood <- -sum(ar_model$resid^2) - log(2 * pi) * length(ar_model$resid)
+  k <- order + 1
+  aic_values[order] <- -2 * log_likelihood + 2 * k
+}
+
+# Find the order with the smallest AIC
+best_order <- which.min(aic_values)
+
+# Print AIC values for all models and the best order
+cat("AIC values for AR(1) to AR(5) models:", aic_values, "\n")
+cat("Best order (smallest AIC): AR(", best_order, ")\n")
+```
+
+```{r}
+# Define the order (in this case, AR(2))
+order <- 2
+
+# Fit AR(2) model
+ar_model <- ar(excess_rt, order.max = order)  # Change to excess_rt
+
+# Get AR coefficients
+ar_coeffs <- ar_model$ar[-1]
+
+# Initialize vector to store forecasted values
+forecasted_values <- numeric(0)
+
+# Generate forecasts for all times in the sample
+for (i in (order + 1):length(excess_rt)) {  # Change to excess_rt
+  forecasted_value <- sum(ar_coeffs * excess_rt[(i - order):(i - 1)])  # Change to excess_rt
+  forecasted_values <- c(forecasted_values, forecasted_value)
+}
+
+# Calculate squared forecast errors
+squared_forecast_errors <- (excess_rt[(order + 1):length(excess_rt)] - forecasted_values)^2  # Change to excess_rt
+
+# Calculate MSFE
+msfe <- mean(squared_forecast_errors)
+
+# Print MSFE for AR(2) model
+cat("MSFE for AR(2) model:", msfe, "\n")
+
+
+```
+
+
+```{r}
+# Calculate AIC and BIC for the AR(5) model
+ar_aic <- AIC(ar_model)
+ar_bic <- BIC(ar_model)
+
+# Print AIC and BIC values for the AR(5) model
+cat("AIC for AR(5) model:", ar_aic, "\n")
+cat("BIC for AR(5) model:", ar_bic, "\n")
+```
+
+
+```{r}
+# Load necessary libraries
+library(caret)
+library(Metrics)
+
+# Assuming 'excess_rt' is the target variable, and you have 18 predictor columns
+target_variable <- tsdata$excess_returns
+predictor_columns <- colnames(tsdata)[!colnames(tsdata) %in% target_variable]
+
+# Number of lags to include
+num_lags <- 3  # You can change this to the number of lags you want to include
+
+# Initialize a data frame to store MSFEs
+msfe_results <- data.frame(Variable = character(0), MSFE = numeric(0))
+
+# Loop through each predictor variable
+for (predictor in predictor_columns) {
+  # Create a data frame with the target and predictor variables
+  data <- tsdata[, c(target_variable, predictor)]
+  
+  # Remove rows with missing values (NaN)
+  data <- na.omit(data)
+  
+  # Create lagged versions of the predictor variable
+  for (lag in 1:num_lags) {
+    lagged_column <- paste(predictor, "lag", lag, sep = "_")
+    data[lagged_column] <- lag(data[, predictor], lag)
+  }
+  
+  # Remove rows with missing values due to lag
+  data <- na.omit(data)
+  
+  # Split the data into training and testing sets
+  train_size <- 0.8
+  train_rows <- floor(train_size * nrow(data))
+  train_data <- data[1:train_rows, ]
+  test_data <- data[(train_rows + 1):nrow(data), ]
+  
+  # Fit an OLS model
+  ols_formula <- as.formula(paste(target_variable, "~ ."))
+  ols_model <- lm(ols_formula, data = train_data)
+  
+  # Make predictions on the test set
+  predicted_values <- predict(ols_model, newdata = test_data)
+  
+  # Calculate squared forecast errors
+  squared_forecast_errors <- (test_data[, target_variable] - predicted_values)^2
+  
+  # Calculate MSFE
+  msfe <- mean(squared_forecast_errors)
+  
+  # Store the results in the data frame
+  msfe_results <- rbind(msfe_results, data.frame(Variable = predictor, MSFE = msfe))
+}
+
+# Find the predictor with the smallest MSFE
+best_predictor <- msfe_results[which.min(msfe_results$MSFE), ]
+
+# Print MSFEs for all predictor models and the best predictor
+print(msfe_results)
+cat("Best predictor:", best_predictor$Variable, "with MSFE:", best_predictor$MSFE, "\n")
+
+```
+
+
+
+
+```{r, echo = FALSE, eval = FALSE}
+# Create a time series plot for the "sp_index" predictor
+sp_index_plot <- ggplot(tsdata, aes(x = time, y = sp_index)) +
+  geom_line() +
+  labs(title = "Time Series Plot of S&P 500 Index", x = "Time", y = "S&P 500 Index")
+print(sp_index_plot)
+
+
+```
+
+```{r, echo = FALSE, eval = FALSE}
+vars_for_ts_plot <- setdiff(names(tsdata) , c("time", "sp_index_lag1m"))
+vars_for_scatter_plot <-  setdiff(names(tsdata) , c("YearMonth", "SP500_Index", "lag_index", "returns", "excess_returns"))
+
+plot_list_ts <- list()
+plot_list_lagged <- list()
+
+# Generate one scatter plot against excess return
+
+for(i in 1:length(vars_for_ts_plot)) {
+  title_text <- paste("(", letters[i], ") ", vars_for_ts_plot[i], sep = "")
+  
+  current_plot_ts <- ggplot(data=tsdata, aes(x=time, y=lag(!!sym(vars_for_ts_plot[i])))) +
+    geom_line() + 
+    ggtitle(title_text) +
+    theme_bw()  
+  
+  plot_list_ts[[i]] <- current_plot_ts
+  
+}
+# Create a grid layout of the plots
+grid.arrange(grobs = plot_list_ts[1:8], ncol = 2)
+grid.arrange(grobs = plot_list_ts[9:16], ncol = 2)
+grid.arrange(grobs = plot_list_ts[17:24], ncol = 2)
+
+```
+
+```{r, echo = FALSE, eval = FALSE}
+# Generate one scatter plot against lagged predictor
+
+for(i in 1:length(vars_for_scatter_plot)) {
+  title_text <- paste("(", letters[i], ") ", vars_for_scatter_plot[i], sep = "")
+  
+  current_plot_scatter<- ggplot(data=tsdata, aes_string(x="excess_returns_lagged", y=vars_for_scatter_plot[i])) +
+    geom_point() + 
+    geom_smooth(method = "lm", se = FALSE, aes(group = 1)) +  # Add regression line
+    ggtitle(title_text) +
+    theme_bw()
+  
+  plot_list_lagged[[i]] <- current_plot_scatter
+}
+
+# lagged plots
+grid.arrange(grobs = plot_list_lagged[1:4], ncol = 2)
+grid.arrange(grobs = plot_list_lagged[5:8], ncol = 2)
+grid.arrange(grobs = plot_list_lagged[9:12], ncol = 2)
+grid.arrange(grobs = plot_list_lagged[13:16], ncol = 2)
+```
+
+```{r, echo = FALSE, eval = FALSE}
+
+```
+
+```{r, echo = FALSE, eval = FALSE}
+
+```
+
+```{r, echo = FALSE, eval = FALSE}
+
+```
+
+```{r, echo = FALSE, eval = FALSE}
+
+```
+
+```{r, echo = FALSE, eval = FALSE}
+
+```
+
+```{r, echo = FALSE, eval = FALSE}
+
+```
+
+```{r, echo = FALSE, eval = FALSE}
+
+```

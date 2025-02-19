@@ -1,0 +1,560 @@
+---
+title: "Project 2"
+author: "Ly Le Thi"
+date: "2023-11-26"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load library
+
+
+```{r}
+rm(list = ls())
+```
+
+```{r, warning=FALSE}
+library(tidyverse)
+library(lubridate)
+library(readxl)
+library(dplyr) 
+library(ggplot2)
+library(zoo)
+library(here)
+library(readxl)
+library(dplyr)
+library(magrittr)
+library(ggplot2)
+library(mice)
+library(quantmod)
+library(tsibble)
+library(stats)
+library(purrr)
+library(rlang)
+library(forecast)
+library(lmSubsets)
+library(caret)
+library(rpart)
+library(randomForest)
+library(keras)
+library(neuralnet)
+library(DALEX)
+library(tensorflow)
+```
+
+
+## a. Import dataset
+
+```{r}
+tsdata <- read_excel("~/Desktop/case study/PredictorData2022.xlsx")
+tsdata$yyyymm <- as.yearmon(as.character(tsdata$yyyymm), format="%Y%m")
+tsdata %<>% select(-CRSP_SPvw, -CRSP_SPvwx, -csp)
+vars_monthly <- names(tsdata)
+
+# Rename the column
+colname_mapping <- c(
+"time" = "yyyymm",
+  "sp_index" = "Index",
+  "dividend_12" = "D12",
+  "earning_12" = "E12",
+  "bookmarketRatio" = "b/m",
+  "treasury_bill" = "tbl",
+  "cor_AAA" = "AAA",
+  "cor_BAA" = "BAA",
+  "longterm_yeild" = "lty",
+  "net_equity" = "ntis",
+  "risk_free" = "Rfree",
+  "inflation" = "infl",
+  "long_returnrate" = "ltr",
+  "cbond_return" = "corpr",
+  "stock_var" = "svar"
+)
+
+filtered_dict_monthly <- colname_mapping[colname_mapping %in% colnames(tsdata)]
+tsdata <- rename(tsdata, !!!filtered_dict_monthly)
+
+# Transform variables into numeric
+for(i in names(tsdata)) {
+  if(class(tsdata[[i]]) == "character") {
+    tsdata[[i]] <- as.numeric(tsdata[[i]])
+  }
+}
+
+## Generate the excess returns series
+calculate_returns <- function(input){
+  input %<>% mutate(returns = as.vector(quantmod::Delt(sp_index))) 
+  input %<>% mutate(excess_returns = returns - risk_free)
+  return(input)
+}
+tsdata %<>% calculate_returns()
+
+# Taking lag of all predictors
+
+lag_predictors <- function(input){
+  output <- input %>%
+    mutate(across(-c(time, excess_returns), lag, .names = "lag_{.col}")) %>% 
+    select(time, excess_returns, starts_with("lag_")) %>% 
+    slice(-1) 
+  return(output)
+}
+
+tsdata %<>% lag_predictors()
+
+```
+
+
+```{r}
+excessmonth <- tsdata%>% dplyr::select(c("time", "excess_returns"))
+# Taking the lag
+for (i in 1:10) {
+  excessmonth <- mutate(excessmonth, !!paste("er_lag_", i, sep = "") := lag(excess_returns, i))
+}
+
+#plug back to tsdata
+
+tsdata <- merge(tsdata, excessmonth, by = "time", all.x = TRUE) # Join excessmonth with tsdata for the all predictors model
+tsdata <- tsdata[, -grep("excess_returns.y", colnames(tsdata))]
+```
+
+
+#Training testing set historical data
+
+
+```{r}
+#get the ts from 1927
+excessmonth <- excessmonth[excessmonth$time >= zoo::as.yearmon("1927-01", format = "%Y-%m"), ]
+tsdata <- na.omit(tsdata)
+```
+
+
+```{r}
+# Traing and testing set
+split_point <- round(0.8 * nrow(excessmonth))
+
+# Create training and testing sets based on the split point
+train_data_er <- subset(excessmonth, time <= excessmonth$time[split_point])
+test_data_er <- subset(excessmonth, time > excessmonth$time[split_point])
+# Define the formula
+max_lag <- 10
+formula_er <- as.formula(paste("excess_returns ~", paste(paste("er_lag_", 1:max_lag, sep = ""), collapse = " + ")))
+```
+
+
+# Regression tree
+
+```{r, warning=FALSE}
+set.seed(128)
+
+rt_model <- rpart(formula_er, data = train_data_er,control = rpart.control(cp = 0.01))
+
+# Predictions
+rt_predictions <- predict(rt_model, newdata = test_data_er)
+
+# Add the predictions to excessmonth based on time
+excessmonth$predicted_excess_returns_rt <- NA  
+# Match predictions to corresponding rows based on time
+for (i in 1:nrow(test_data_er)) {
+  time_index <- which(excessmonth$time == test_data_er$time[i])
+  if (length(time_index) > 0) {
+    excessmonth[time_index, "predicted_excess_returns_rt"] <- rt_predictions[i]
+    
+  }
+}
+    # Plot results
+ggplot(excessmonth, aes(x = time)) +
+  geom_line(aes(y = excess_returns, color = "Actual")) +
+  geom_line(aes(y = predicted_excess_returns_rt, color = "Predicted")) +
+  labs(title = "Actual vs. Predicted Excess Returns using Regression Tree",
+       x = "Time",
+       y = "Excess Returns") +
+  scale_color_manual(values = c("Actual" = "blue", "Predicted" = "red"))
+
+# Calculate MSFE
+
+rt_actual_values <- test_data_er$excess_returns
+rt_rmse <- sqrt(mean((rt_predictions - rt_actual_values)^2))
+
+cat("Mean Squared Forecast Error (MSFE):", rt_rmse, "\n")
+```
+
+
+```{r}
+
+# Calculate and plot important using DALEX
+train_data_er_subset <- train_data_er[, !names(train_data_er) %in% c("excess_returns", "time")]
+explainer <- explain(model = rt_model,
+                     data = train_data_er_subset,
+                     y = train_data_er$excess_returns,
+                     label = "Regression Tree Model")
+
+# Calculate permutation feature importance
+perm_importance <- variable_importance(explainer)
+
+print(perm_importance)
+model_explanations <- DALEX::model_parts(explainer)
+plot(model_explanations)
+
+```
+
+
+## Random forest
+
+```{r, warning=FALSE}
+set.seed(512)
+
+rf_model <- randomForest(
+  formula_er, 
+  data = train_data_er,
+  ntree = 182, 
+  mtry = 3,  
+  importance = TRUE 
+)
+
+
+rf_predictions <- predict(rf_model, newdata = test_data_er)
+
+excessmonth$predicted_excess_returns_rf <- NA
+
+# Match predictions to corresponding rows based on time
+for (i in 1:nrow(test_data_er)) {
+  time_index <- which(excessmonth$time == test_data_er$time[i])
+  if (length(time_index) > 0) {
+    excessmonth[time_index, "predicted_excess_returns_rf"] <- rf_predictions[i]
+  }
+}
+# Plot results
+ggplot(excessmonth, aes(x = time)) +
+  geom_line(aes(y = excess_returns, color = "Actual")) +
+  geom_line(aes(y = predicted_excess_returns_rf, color = "Predicted"), linetype = "dashed") +
+  labs(title = "Actual vs. Predicted Excess Returns using Random Forest",
+       x = "Time",
+       y = "Excess Returns") +
+  scale_color_manual(values = c("Actual" = "blue", "Predicted" = "red"))
+
+rf_actual_values <- test_data_er$excess_returns
+rf_msfe <- sqrt(mean((rf_predictions - rf_actual_values)^2))
+cat("Mean Squared Forecast Error (MSFE):", rf_msfe, "\n")
+
+```
+
+
+```{r}
+
+explainer2 <- explain(model = rf_model,
+                      data = train_data_er_subset,
+                      y = train_data_er$excess_returns,
+                      label = "Random Forest Model")
+
+# Calculate permutation feature importance
+perm_importance2 <- variable_importance(explainer2)
+
+print(perm_importance2)
+
+# Generate model explanations
+model_explanations2 <- DALEX::model_parts(explainer2)
+plot(model_explanations2)
+
+```
+
+
+In neural networks, calculating feature importance is not as straightforward as in some other machine learning models like random forests. Neural networks operate as complex, interconnected systems, and the contribution of each input to the output is distributed across the network's layers and weights.
+
+However, you can get some insights into feature importance in a neural network through methods like looking at the weights associated with the input features. In your case, since you're using the neuralnet package in R, you can extract the weights from the trained model and analyze them.
+
+
+## Neural Network
+
+```{r}
+set.seed(123)
+
+# NN hyperparameters
+lag_val <- 5
+hidden_neurons_val <- 5
+nn_architecture <- c(10, hidden_neurons_val, 1)
+
+
+model_nn <- neuralnet(
+  formula_er,
+  data = train_data_er,
+  hidden = nn_architecture[2],
+  linear.output = TRUE
+)
+
+# Make predictions on the test data
+predictions_nn <- predict(model_nn, newdata = test_data_er)
+
+# Evaluate performance
+performance <- sqrt(mean((test_data_er$excess_returns - predictions_nn)^2))
+cat("Root Mean Squared Error:", performance, "\n")
+
+
+```
+
+
+
+```{r}
+# Plug prediction back to excessmonth depends on time
+excessmonth$predicted_excess_returns_nn <- NA
+
+for (i in 1:nrow(test_data_er)) {
+  time_index <- which(excessmonth$time == test_data_er$time[i])
+  if (length(time_index) > 0) {
+    excessmonth[time_index, "predicted_excess_returns_nn"] <- predictions_nn[i]
+  }
+}
+```
+
+
+```{r, warning=FALSE}
+
+ggplot(excessmonth, aes(x = time)) +
+  geom_line(aes(y = excess_returns, color = "Actual")) +
+  geom_line(aes(y = predicted_excess_returns_nn, color = "Predicted"), linetype = "dashed") +
+  labs(title = "Actual vs. Predicted Excess Returns using Neural Network",
+       x = "Time",
+       y = "Excess Returns") +
+  scale_color_manual(values = c("Actual" = "blue", "Predicted" = "red"))
+```
+```{r}
+explainer <- explain(model = model_nn,
+                     data = train_data_er_subset,
+                     y = train_data_er$excess_returns,
+                     label = "NN_model")
+
+# Calculate variable importance
+vi_nn <- model_parts(explainer, B = 10)
+
+# Print variable importance
+print(vi_nn)
+plot(vi_nn)
+```
+
+
+
+## Forecasting for the whole data
+
+
+```{r}
+
+# Traing and testing set
+split_point <- round(0.8 * nrow(tsdata))
+
+# Create training and testing sets based on the split point
+train_data_ts <- subset(tsdata, time <= tsdata$time[split_point])
+test_data_ts <- subset(tsdata, time > tsdata$time[split_point])
+target_variable <- "excess_returns.x"
+
+predictor_variables <- setdiff(names(tsdata), c(target_variable, "lag_returns", "time", "lag_sp_index"))
+
+formula_all <- as.formula(paste(target_variable, "~", paste(paste(predictor_variables, collapse = " + "), collapse = " + "))) 
+```
+
+## Regression tree
+
+```{r, warning=FALSE}
+set.seed(1024)
+
+
+rt_model_all <- rpart(formula_all, data = train_data_ts, control = rpart.control(cp = 0.01))
+
+# Predictions using the general data regression tree model
+rt_predictions_all <- predict(rt_model_all, newdata = test_data_ts)
+
+
+tsdata$predicted_excess_returns_rt <- NA
+
+# Match predictions to corresponding rows based on time
+for (i in 1:nrow(test_data_ts)) {
+  time_index <- which(tsdata$time == test_data_ts$time[i])
+  if (length(time_index) > 0) {
+    tsdata[time_index, "predicted_excess_returns_rt"] <- rt_predictions_all[i]
+  }
+}
+
+ggplot(tsdata, aes(x = time)) +
+  geom_line(aes(y = excess_returns.x, color = "Actual")) +
+  geom_line(aes(y = predicted_excess_returns_rt, color = "Predicted")) +
+  labs(title = "Actual vs. Predicted Excess Returns using Regression Tree all",
+       x = "Time",
+       y = "Excess Returns") +
+  scale_color_manual(values = c("Actual" = "blue", "Predicted" = "red"))
+
+
+
+# calculate MSFE
+
+rt_actual_values_all <- test_data_ts$excess_returns.x
+rt_msfe_all <- sqrt(mean((rt_predictions_all - rt_actual_values_all)^2))
+
+cat("Mean Squared Forecast Error (MSFE) for Regression Tree:", rt_msfe_all, "\n")
+```
+
+
+```{r}
+
+# Calculate feature importance
+train_data_ts_subset <- train_data_ts[, !names(train_data_ts) %in% c("excess_returns.x", "time", "lag_returns","lag_sp_index")]
+
+# Create an explainer object
+explainer <- explain(model = rt_model_all,
+                     data = train_data_ts_subset,
+                     y = train_data_ts$excess_returns.x,
+                     label = "Regression Tree Model")
+
+# Calculate permutation feature importance
+perm_importance <- variable_importance(explainer)
+print(perm_importance)
+
+# Generate model explanations
+model_explanations <- DALEX::model_parts(explainer)
+plot(model_explanations)
+
+```
+
+
+## Random Forest
+
+```{r, warning=FALSE}
+set.seed(512)
+
+# Building the Random Forest model for general data
+rf_model_all <- randomForest(
+  formula_all,
+  data = train_data_ts,
+  ntree = 178,  
+  mtry = 3,  
+  importance = TRUE  
+)
+
+
+predictions_rf_all <- predict(rf_model_all, newdata = test_data_ts)
+
+tsdata$predicted_excess_returns_rf <- NA
+
+# Match predictions to corresponding rows based on time
+for (i in 1:nrow(test_data_ts)) {
+  time_index <- which(tsdata$time == test_data_ts$time[i])
+  if (length(time_index) > 0) {
+    tsdata[time_index, "predicted_excess_returns_rf"] <- predictions_rf_all[i]
+  }
+}
+
+ggplot(tsdata, aes(x = time)) +
+  geom_line(aes(y = excess_returns.x, color = "Actual")) +
+  geom_line(aes(y = predicted_excess_returns_rf, color = "Predicted"), linetype = "dashed") +
+  labs(title = "Actual vs. Predicted Excess Returns using Random Forest all",
+       x = "Time",
+       y = "Excess Returns") +
+  scale_color_manual(values = c("Actual" = "blue", "Predicted" = "red"))
+
+# Actual values from the test set for general data
+rf_actual_values_all <- test_data_ts$excess_returns.x
+
+# Calculating the RMSE (Root Mean Squared Error) for general data using general random forest model
+rf_rmse_all <- sqrt(mean((predictions_rf_all - rf_actual_values_all)^2))
+cat("Mean Squared Forecast Error (MSFE) for Random Forest:", rf_rmse_all, "\n")
+
+```
+
+```{r}
+train_data_ts_subset <- train_data_ts[, !names(train_data_ts) %in% c("excess_returns.x", "time", "lag_returns","lag_sp_index")]
+# Create an explainer object
+explainer <- explain(model = rf_model_all,
+                     data = train_data_ts_subset,
+                     y = train_data_ts$excess_returns.x,
+                     label = "Regression Tree Model")
+
+# Calculate permutation feature importance
+perm_importance <- variable_importance(explainer)
+
+# Print the result
+print(perm_importance)
+
+# Generate model explanations
+model_explanations <- DALEX::model_parts(explainer)
+
+# Print variable importance plot
+plot(model_explanations)
+
+```
+
+
+
+
+## Neural Networks
+
+
+```{r}
+set.seed(123)
+
+# NN hyperparameters
+lag_val <- 5
+hidden_neurons_val <- 10
+nn_architecture <- c(10, hidden_neurons_val, 1)
+
+
+model_nnall <- neuralnet(
+  formula_all,
+  data = train_data_ts,
+  hidden = nn_architecture[2],
+  linear.output = TRUE
+)
+
+# Make predictions on the test data
+predictions_nnall <- predict(model_nnall, newdata = test_data_ts)
+
+# Evaluate performance
+performance2 <- sqrt(mean((test_data_ts$excess_returns.x - predictions_nnall)^2))
+cat("Root Mean Squared Error:", performance2, "\n")
+```
+
+
+```{r, warning=FALSE}
+
+tsdata$predicted_excess_returns_nn <- NA
+
+# Match predictions to corresponding rows based on time
+for (i in 1:nrow(test_data_ts)) {
+  time_index <- which(tsdata$time == test_data_ts$time[i])
+  if (length(time_index) > 0) {
+    tsdata[time_index, "predicted_excess_returns_nn"] <- predictions_nnall[i]
+  }
+}
+
+```
+
+
+```{r, warning=FALSE}
+ggplot(tsdata, aes(x = time)) +
+  geom_line(aes(y = excess_returns.x, color = "Actual")) +
+  geom_line(aes(y = predicted_excess_returns_nn, color = "Predicted")) +
+  labs(title = "Actual vs. Predicted Excess Returns using Regression Tree all",
+       x = "Time",
+       y = "Excess Returns") +
+  scale_color_manual(values = c("Actual" = "blue", "Predicted" = "red"))
+```
+
+```{r}
+explainer3 <- explain(model = model_nnall,
+                     data = train_data_ts_subset,
+                     y = train_data_ts$excess_returns.x,
+                     label = "NN_model")
+
+# Calculate variable importance
+vi_nn2 <- model_parts(explainer3, B = 10)
+
+# Print variable importance
+print(vi_nn2)
+plot(vi_nn2)
+```
+
+
+
+
+
+
+
+
