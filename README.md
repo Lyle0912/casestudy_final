@@ -1,1 +1,1 @@
-## Using ARIMA, neural networks and random forest to forcast the excess return
+## Using ARIMA, neural networks and random forest to forecast the excess return
